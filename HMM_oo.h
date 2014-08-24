@@ -225,36 +225,6 @@ void CHMM<T>::ViterbiAssignment()
 	}
 	delete[] Vs;
 	delete[] psis;
-	/*
-	void Viterbi(double** V_s,double* observation_sequence,double** log_emission_prob_wave,double** log_trans_prob_wave,double* init_prob_wave,
-			 int num_emission_values,double x_min,double dx,int num_states,int npnts)
-{
-	// CAREFUL, this assumes that
-	// the system is initially in state 0 ....
-	//V_s[0][0] = log(init_prob_wave[0])+ReturnEmissionProbability(log_emission_prob_wave, num_emission_values, x_min, dx, 0, observation_sequence[0]);
-	for(int i=0;i<num_states;++i)
-		V_s[0][i] =  log(init_prob_wave[i])+ReturnEmissionProbability(log_emission_prob_wave, num_emission_values, x_min, dx, i, observation_sequence[0]);;
-	
-	double log_prob_max,log_prob;
-	int state_max_index;
-	for(int i=1;i<npnts;++i)
-		for(int j=0;j<num_states;++j)
-		{
-			log_prob_max=V_s[i-1][0] + log_trans_prob_wave[0][j]+ReturnEmissionProbability(log_emission_prob_wave, num_emission_values, x_min, dx, j, observation_sequence[i]);
-			state_max_index=0;
-			for(int k=1;k<num_states;++k)
-			{
-				log_prob=V_s[i-1][k] + log_trans_prob_wave[k][j]+ReturnEmissionProbability(log_emission_prob_wave, num_emission_values, x_min, dx, j, observation_sequence[i]);
-				if(log_prob>log_prob_max)
-				{
-					log_prob_max=log_prob;
-					state_max_index=k;
-				}
-			}
-			V_s[i][j]=log_prob_max;
-		}
-}*/
-
 }
 
 template <typename T>
@@ -368,15 +338,6 @@ void CHMM<T>::CalculateZetas()
 			for(int j=0;j<m_num_states;++j)
 		m_zetas[t][i][j] = m_gammas[t][i]*m_state_transition_probs[i][j]*m_state_emission_probabilities[j][m_binned_values[t+1]]*m_scaling_factors[t+1]*m_betas[t+1][j]/(m_betas[t][i]);
 	}
-	/*void CalculateEpsilons(double*** epsilons,double* observation_sequence,double** trans_prob_wave,double** emission_prob_wave,double** alphas_scaled,
-					   double** betas_scaled,double** gammas,double* scaling_factors,int num_emission_values,double x_min,double dx,int num_states,int npnts)
-{
-	for(int t=0;t<npnts-1;++t)
-		for(int i=0;i<num_states;++i)
-			for(int j=0;j<num_states;++j)
-				epsilons[t][i][j]=(gammas[t][i]*trans_prob_wave[i][j]*ReturnEmissionProbability(emission_prob_wave,num_emission_values, x_min, dx, j, 
-																								observation_sequence[t+1])*scaling_factors[t+1]*betas_scaled[t+1][j]/(betas_scaled[t][i]));
-}*/
 }
 
 template <typename T>
@@ -427,7 +388,6 @@ void CHMM<T>::ForwardAlgorithm()
 	m_scaling_factors.clear();
 	
 	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
-	//m_alphas.resize(num_points);
 	m_alphas.reserve(num_points);
 	
 	vector<double> alphas_temp;
@@ -466,10 +426,6 @@ void CHMM<T>::ForwardAlgorithm()
 	}
 }
 
-
-// CAREFUL, REVERSE OF ORDER 
-// HAS NOT BEEN IMPLEMENTED YET...
-
 template <typename T>
 void CHMM<T>::BackwardAlgorithm()
 {
@@ -485,12 +441,6 @@ void CHMM<T>::BackwardAlgorithm()
 		m_betas.push_back(temp_vector);
 	}
 	
-	//m_betas.reserve(num_points);
-	
-	/*vector<double> betas_temp;
-	for(int index_state=0;index_state<m_num_states;index_state++)
-		betas_temp.push_back(1.0f);
-	*/
 	for(int index_state=0;index_state<m_num_states;index_state++)
 	{
 		m_betas[num_points-1][index_state]=1.0f;

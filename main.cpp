@@ -15,8 +15,6 @@ int main (int argc, char * const argv[])
 	string filename("C:\\Studium\\Promotion\\C-Codes\\HMM_object_oriented\\HMM_object_oriented\\sequence_part.txt");
 	hmm_data.ReadHMMDataFromTxt(filename,HMM_DATA_FP);
 	
-	
-	
 	int loc_num_states=3;
 	int loc_num_bins=300;
 	
