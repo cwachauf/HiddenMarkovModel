@@ -12,7 +12,10 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <algorithm>
 #include <iostream>
+#include <deque>
+
 #include "HMM_binner.h"
 #include "EmissionProb.h"
 
@@ -20,6 +23,7 @@ using namespace std;
 
 const int HMM_DATA_INT = 1;
 const int HMM_DATA_FP = 2;
+const double MIN_EMISSION_PROBABILITY=1e-6; // 1e-6 as minimal emission probability...
 
 template <typename T>
 class CHMMData
@@ -52,8 +56,26 @@ private:
 	vector<vector<double> > m_state_transition_probs;
 	vector<unsigned short int> m_binned_values;
 	vector<vector<double> > m_state_emission_probabilities;
+	
+	vector<vector<double> > m_alphas; // return values of the forward algorithm
+	vector<vector<double> > m_betas; // return values of the backward algorithm
+	vector<vector<double> > m_gammas;
+	vector<vector<vector<double> > > m_zetas;
+
+	vector<double> m_scaling_factors;	// scaling factors obtained from the Forward algorithm...
+	//vector<unsigned short int> m_viterbi_states;
+	unsigned short int* m_viterbi_states;
+	vector<unsigned short int> m_max_states;
+
+	void ForwardAlgorithm();
+	void BackwardAlgorithm();
+	void CalculateGammas();
+	void CalculateZetas();
+	void UpdateParameters();
+	void BackTrack(double** ppVs,unsigned short int** ppPsis);
 public:
 	//CHMM();
+	~CHMM();
 	void SetPointerToHMMData(CHMMData<T>* p_to_data){ m_p_to_data=p_to_data;}
 	void SetNumberOfStates(int nstates){ m_num_states=nstates;}
 	void SetOrderOfMarkovChain(int order){ m_order_of_markov_chain=order;}
@@ -64,7 +86,426 @@ public:
 	void Iterate();
 	void DoBinningOfObservations();	// do the binning of the values...
 	void InitializeEmissionProbabilities(const int type, vector<vector<T> >& metadata);
+	void ViterbiAssignment();
+	void MaxAssignment();
+	void WriteAssignmentToFile(string filename);
+	void WriteViterbiAssignmentToFile(string filename);
 };
+
+template<typename T>
+void CHMM<T>::WriteViterbiAssignmentToFile(string filename)
+{
+	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+
+	FILE* fp_output = fopen(filename.c_str(),"wt");
+	for(int i=0;i<num_points;++i)
+	{
+		fprintf(fp_output,"%d\n",this->m_viterbi_states[i]);
+	}
+	fclose(fp_output);
+}
+
+template <typename T>
+CHMM<T>::~CHMM()
+{
+	if(m_viterbi_states!=NULL)
+		delete[] m_viterbi_states;
+}
+
+template <typename T>
+void CHMM<T>::WriteAssignmentToFile(string filename)
+{
+	// oldschool C, change it at some point..
+	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+	FILE* fp_outputfile = fopen(filename.c_str(),"wt");
+	for(int i=0;i<num_points;++i)
+		fprintf(fp_outputfile,"%d\n",m_max_states[i]);
+	fclose(fp_outputfile);
+}
+
+template <typename T>
+void CHMM<T>::BackTrack(double** ppVs,unsigned short int** ppPsis)
+{
+	// fill m_viterbi_states with the most
+	// probable single state sequence (as obtained by Viterbi-algorithm)
+	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+
+	m_viterbi_states = new unsigned short int[num_points];
+	int state_max_index=0;
+	double max_V = ppVs[num_points-1][0];
+	for(int i=1;i<m_num_states;++i)
+	{
+		if(ppVs[num_points-1][i]>max_V)
+		{
+			max_V = ppVs[num_points-1][i];
+			state_max_index=i;
+		}
+	}
+	m_viterbi_states[num_points-1]=state_max_index;
+	for(int t=num_points-2;t>=0;t--)
+		m_viterbi_states[t] = ppPsis[t+1][m_viterbi_states[t+1]];
+}
+
+template <typename T>
+void CHMM<T>::ViterbiAssignment()
+{
+	// calculate the log-probabilities
+	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+
+	double* log_state_initial_probs = new double[m_num_states];
+	double** log_state_trans_probs = new double*[m_num_states];
+	double** log_state_em_probs = new double*[m_num_states];
+	double** Vs = new double*[num_points];
+	unsigned short int** psis = new unsigned short int*[num_points];
+
+	for(int i=0;i<num_points;++i)
+	{
+		psis[i] = new unsigned short int[m_num_states];
+		Vs[i] = new double[m_num_states];
+	}
+//	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+	for(int i=0;i<m_num_states;++i)
+	{
+		log_state_trans_probs[i] = new double[m_num_states];
+		log_state_em_probs[i] = new double[m_num_bins];
+		
+		log_state_initial_probs[i] = log10(m_initial_state_probs[i]);
+		for(int j=0;j<m_num_states;j++)
+			log_state_trans_probs[i][j] = log10(m_state_transition_probs[i][j]);
+		for(int j=0;j<m_num_bins;j++)
+			log_state_em_probs[i][j] = log10(m_state_emission_probabilities[i][j]);
+	}
+
+	// initialize values for Viterbi-algorithm:
+	for(int i=0;i<m_num_states;++i)
+	{
+		Vs[0][i] = log_state_initial_probs[i] + log_state_em_probs[i][m_binned_values[0]];
+		psis[0][i] = 0;
+	}
+		//
+
+	double log_prob_max,log_prob;
+	int state_max_index;
+	for(int i=1;i<num_points;++i)
+		for(int j=0;j<m_num_states;++j)
+		{
+			state_max_index=0;
+			log_prob_max = Vs[i-1][0]+log_state_trans_probs[0][j]+log_state_em_probs[j][m_binned_values[i]];
+			for(int k=1;k<m_num_states;++k)
+			{
+				log_prob = Vs[i-1][k]+log_state_trans_probs[k][j]+log_state_em_probs[j][m_binned_values[i]];
+				if(log_prob>log_prob_max)
+				{
+					state_max_index=k;
+					log_prob_max=log_prob;
+				}
+			}
+			psis[i][j]=state_max_index;
+			Vs[i][j]=log_prob_max;
+		}
+
+	// compute the actual Viterbi-sequence via
+	// back-tracking...
+	BackTrack(Vs,psis);
+
+	for(int i=0;i<m_num_states;++i)
+	{
+		delete[] log_state_em_probs[i];
+		delete[] log_state_trans_probs[i];
+	}	
+	
+	delete[] log_state_em_probs;
+	delete[] log_state_trans_probs;
+	delete[] log_state_initial_probs;
+
+	for(int i=0;i<num_points;++i)
+	{
+		delete[] Vs[i];
+		delete[] psis[i];
+	}
+	delete[] Vs;
+	delete[] psis;
+	/*
+	void Viterbi(double** V_s,double* observation_sequence,double** log_emission_prob_wave,double** log_trans_prob_wave,double* init_prob_wave,
+			 int num_emission_values,double x_min,double dx,int num_states,int npnts)
+{
+	// CAREFUL, this assumes that
+	// the system is initially in state 0 ....
+	//V_s[0][0] = log(init_prob_wave[0])+ReturnEmissionProbability(log_emission_prob_wave, num_emission_values, x_min, dx, 0, observation_sequence[0]);
+	for(int i=0;i<num_states;++i)
+		V_s[0][i] =  log(init_prob_wave[i])+ReturnEmissionProbability(log_emission_prob_wave, num_emission_values, x_min, dx, i, observation_sequence[0]);;
+	
+	double log_prob_max,log_prob;
+	int state_max_index;
+	for(int i=1;i<npnts;++i)
+		for(int j=0;j<num_states;++j)
+		{
+			log_prob_max=V_s[i-1][0] + log_trans_prob_wave[0][j]+ReturnEmissionProbability(log_emission_prob_wave, num_emission_values, x_min, dx, j, observation_sequence[i]);
+			state_max_index=0;
+			for(int k=1;k<num_states;++k)
+			{
+				log_prob=V_s[i-1][k] + log_trans_prob_wave[k][j]+ReturnEmissionProbability(log_emission_prob_wave, num_emission_values, x_min, dx, j, observation_sequence[i]);
+				if(log_prob>log_prob_max)
+				{
+					log_prob_max=log_prob;
+					state_max_index=k;
+				}
+			}
+			V_s[i][j]=log_prob_max;
+		}
+}*/
+
+}
+
+template <typename T>
+void CHMM<T>::MaxAssignment()
+{
+	m_max_states.clear();
+	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+	for(int i=0;i<num_points;++i)
+	{
+		double max_value=m_gammas[i][0];
+		unsigned short int max_index = 0;
+		for(int j=1;j<m_num_states;++j)
+		{
+			if(m_gammas[i][j]>max_value)
+			{
+				max_value=m_gammas[i][j];
+				max_index=j;	
+			}
+		}
+		m_max_states.push_back(max_index);
+	}
+}
+
+
+template <typename T>
+void CHMM<T>::UpdateParameters()
+{
+	
+	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+	double* temp_denominators = new double[m_num_states];
+	for(int i=0;i<m_num_states;++i)
+	{
+		// for each state, initial state probability is given
+		// by gamma_i_0
+		m_initial_state_probs[i]=m_gammas[0][i];
+		// set state-transition probabilities
+		// and state emission probabilities to zero...
+		for(int j=0;j<m_num_states;++j)
+			m_state_transition_probs[i][j]=0.0f;
+		for(int j=0;j<m_num_bins;++j)
+			m_state_emission_probabilities[i][j]=0.0f;
+		
+		temp_denominators[i]=0.0f;
+
+		// update the state transition probabilities
+		// using the precalculated zetas
+		for(int t=0;t<(num_points-1);t++)
+		{
+			for(int j=0;j<m_num_states;++j)
+			{
+				m_state_transition_probs[i][j]+=m_zetas[t][i][j];
+				temp_denominators[i]+=m_zetas[t][i][j];
+			}
+		}
+		// normalize the state transition probabilities
+		for(int j=0;j<m_num_states;++j)
+			m_state_transition_probs[i][j]/=temp_denominators[i];
+	}
+	delete[] temp_denominators;
+
+	double* sums = new double[m_num_states];
+	for(int i=0;i<m_num_states;++i)
+	{
+		sums[i]=0.0f;
+		for(int t=0;t<num_points;++t)
+		{
+			sums[i]+=m_gammas[t][i];
+			int curr_index = m_binned_values[t];
+			m_state_emission_probabilities[i][curr_index]+=m_gammas[t][i];
+		}
+	}
+	
+	// first round of normalization
+	for(int i=0;i<m_num_states;++i)
+		for(int j=0;j<m_num_bins;++j)
+			m_state_emission_probabilities[i][j]/=sums[i];
+	
+	// second round of normalization
+	for(int i=0;i<m_num_states;++i)
+	{
+		double sum_ems=0.0f;
+		for(int j=0;j<m_num_states;++j)
+		{
+			if(m_state_emission_probabilities[i][j]<MIN_EMISSION_PROBABILITY)
+				m_state_emission_probabilities[i][j]=MIN_EMISSION_PROBABILITY;
+			sum_ems+=m_state_emission_probabilities[i][j];
+		}
+		for(int j=0;j<m_num_states;++j)
+			m_state_emission_probabilities[i][j]/=sum_ems;
+	}
+}
+
+template <typename T>
+void CHMM<T>::CalculateZetas()
+{
+	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+	vector<vector<double> > temp_matrix;
+	vector<double> temp_vector;
+
+	for(int i=0;i<m_num_states;++i)
+		temp_vector.push_back(0.0f);
+	
+	for(int j=0;j<m_num_states;++j)
+		temp_matrix.push_back(temp_vector);
+
+	
+	for(int t=0;t<num_points-1;++t)
+	{
+		m_zetas.push_back(temp_matrix);	
+		for(int i=0;i<m_num_states;++i)
+			for(int j=0;j<m_num_states;++j)
+		m_zetas[t][i][j] = m_gammas[t][i]*m_state_transition_probs[i][j]*m_state_emission_probabilities[j][m_binned_values[t+1]]*m_scaling_factors[t+1]*m_betas[t+1][j]/(m_betas[t][i]);
+	}
+	/*void CalculateEpsilons(double*** epsilons,double* observation_sequence,double** trans_prob_wave,double** emission_prob_wave,double** alphas_scaled,
+					   double** betas_scaled,double** gammas,double* scaling_factors,int num_emission_values,double x_min,double dx,int num_states,int npnts)
+{
+	for(int t=0;t<npnts-1;++t)
+		for(int i=0;i<num_states;++i)
+			for(int j=0;j<num_states;++j)
+				epsilons[t][i][j]=(gammas[t][i]*trans_prob_wave[i][j]*ReturnEmissionProbability(emission_prob_wave,num_emission_values, x_min, dx, j, 
+																								observation_sequence[t+1])*scaling_factors[t+1]*betas_scaled[t+1][j]/(betas_scaled[t][i]));
+}*/
+}
+
+template <typename T>
+void CHMM<T>::Iterate()
+{
+	cout << "ForwardAlgorithm" << endl;
+	ForwardAlgorithm();
+	cout << "BackwardAlgorithm" << endl;
+	BackwardAlgorithm();
+	cout << "CalculateGammas" << endl;
+	CalculateGammas();
+	cout << "CalculateZetas" << endl;
+	CalculateZetas();
+	cout << "UpdateParameters" << endl;
+	UpdateParameters();
+	PrintOutCurrentValues();
+
+}
+template <typename T>
+void CHMM<T>::CalculateGammas()
+{
+	m_gammas.clear();
+	vector<double> temp_gammas;
+	
+	double denominator;
+	
+	int num_points=m_p_to_data->ReturnNumberOfDataPoints();
+	for(int index_point=0;index_point<num_points;++index_point)
+	{
+		denominator=0.0f;
+		temp_gammas.clear();
+		for(int index_state=0;index_state<m_num_states;index_state++)
+			denominator+=m_alphas[index_point][index_state]*m_betas[index_point][index_state];
+		for(int index_state=0;index_state<m_num_states;index_state++)
+		{
+			temp_gammas.push_back(0.0f);
+			temp_gammas[index_state] = m_alphas[index_point][index_state]*m_betas[index_point][index_state]/denominator;
+		}
+		m_gammas.push_back(temp_gammas);
+	}
+}
+
+template <typename T>
+void CHMM<T>::ForwardAlgorithm() 
+{
+	// clear alphas and scaling factors, which will be calculated again from scratch...
+	m_alphas.clear(); 
+	m_scaling_factors.clear();
+	
+	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+	//m_alphas.resize(num_points);
+	m_alphas.reserve(num_points);
+	
+	vector<double> alphas_temp;
+	m_scaling_factors.push_back(0.0f);
+	
+	for(int index_state=0;index_state<m_num_states;index_state++)
+	{
+		alphas_temp.push_back(0.0f);
+		alphas_temp[index_state]=m_initial_state_probs[index_state]*m_state_emission_probabilities[index_state][m_binned_values[0]];
+		m_scaling_factors[0]+=alphas_temp[index_state];
+	}
+	m_scaling_factors[0]=1.0f/m_scaling_factors[0];
+	// now scale the temporary alphas and push them back...
+	for(int index_state=0;index_state<m_num_states;index_state++)
+		alphas_temp[index_state]*=m_scaling_factors[0];
+	m_alphas.push_back(alphas_temp);
+	
+	
+	// calculate the rest of the alphas and scaling factors..
+	for(int index_point=1;index_point<num_points;index_point++)
+	{
+		alphas_temp.clear();
+		m_scaling_factors.push_back(0.0f);
+		for(int index_state=0;index_state<m_num_states;index_state++)
+		{
+			alphas_temp.push_back(0.0f);
+			for(int k=0;k<m_num_states;k++)
+				alphas_temp[index_state]+=m_alphas[index_point-1][k]*m_state_transition_probs[k][index_state]*m_state_emission_probabilities[index_state][m_binned_values[index_point]];
+		
+			m_scaling_factors[index_point]+=alphas_temp[index_state];
+		}
+		m_scaling_factors[index_point] = 1.0f/m_scaling_factors[index_point];
+		for(int index_state=0;index_state<m_num_states;index_state++)
+			alphas_temp[index_state]*=m_scaling_factors[index_point];
+		m_alphas.push_back(alphas_temp);
+	}
+}
+
+
+// CAREFUL, REVERSE OF ORDER 
+// HAS NOT BEEN IMPLEMENTED YET...
+
+template <typename T>
+void CHMM<T>::BackwardAlgorithm()
+{
+	
+	m_betas.clear();
+	int num_points = m_p_to_data->ReturnNumberOfDataPoints();
+	vector<double> temp_vector;
+	for(int i=0;i<m_num_states;++i)
+		temp_vector.push_back(0.0f);
+	
+	for(int i=0;i<num_points;i++)
+	{
+		m_betas.push_back(temp_vector);
+	}
+	
+	//m_betas.reserve(num_points);
+	
+	/*vector<double> betas_temp;
+	for(int index_state=0;index_state<m_num_states;index_state++)
+		betas_temp.push_back(1.0f);
+	*/
+	for(int index_state=0;index_state<m_num_states;index_state++)
+	{
+		m_betas[num_points-1][index_state]=1.0f;
+	}
+	for(int index_point=num_points-2;index_point>=0;index_point--)
+		for(int index_state=0;index_state<m_num_states;index_state++)
+		{
+			m_betas[index_point][index_state]=0.0f;
+			for(int k=0;k<m_num_states;k++)
+				m_betas[index_point][index_state]+=m_betas[index_point+1][k]*m_state_transition_probs[index_state][k]*m_state_emission_probabilities[k][m_binned_values[index_point+1]];
+			m_betas[index_point][index_state]*=m_scaling_factors[index_point+1];																																	 
+		}
+}
+
+
 
 template <typename T>
 void CHMM<T>::InitializeEmissionProbabilities(const int type, vector<vector<T> >& metadata)
@@ -96,9 +537,21 @@ void CHMM<T>::InitializeEmissionProbabilities(const int type, vector<vector<T> >
 				sum+=prob;
 				temp_vec.push_back(prob);
 			}
-			// normalize and "push_back"
+			double sum2=0.0f;
+			// normalize and account for minimal emission probability
 			for(int index_bin=0;index_bin<m_num_bins;index_bin++)
+			{
 				temp_vec[index_bin]/=sum;
+				// NOTE: A minimal emission probability is applied
+				// No emisssion is supposed to be smaller than this value....
+				if(temp_vec[index_bin]<MIN_EMISSION_PROBABILITY)
+					temp_vec[index_bin]=MIN_EMISSION_PROBABILITY;
+				
+				sum2+=temp_vec[index_bin];
+			}
+			// normalize again and push back
+			for(int index_bin=0;index_bin<m_num_bins;index_bin++)
+				temp_vec[index_bin]/=sum2;
 			
 			m_state_emission_probabilities.push_back(temp_vec);
 		}
@@ -161,6 +614,17 @@ void CHMM<T>::PrintOutCurrentValues()
 		
 		cout << endl;
 	}	 
+	/*
+	cout << "emission values: " << endl;
+	for(int index_state=0;index_state<m_num_states;index_state++)
+	{
+		cout << "state: " << index_state << endl;
+		for(int index_bin=0;index_bin<m_num_bins;++index_bin)
+		{
+			cout << "emission at: " << m_binner.ReturnValueFromIndex((unsigned short int)index_bin) << " " << m_state_emission_probabilities[index_state][index_bin] << endl;
+		}
+	}
+	*/
 }
 
 template <typename T> 
